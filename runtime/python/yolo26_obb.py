@@ -122,8 +122,10 @@ class YOLO26OBB:
 
         sorted_hw = sorted(groups.keys(), key=lambda x: x[0])
 
+        # Process in descending H order so the largest grid (stride=8)
+        # comes first, matching the standard strides iteration [8, 16, 32].
         reordered = []
-        for hw in sorted_hw:
+        for hw in reversed(sorted_hw):
             members = groups[hw]
             # Sort into (cls, box, angle): cls=classes_num(15), box=4, angle=1
             def _obb_sort_key(item):

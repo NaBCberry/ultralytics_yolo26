@@ -229,32 +229,61 @@ class YOLO26Seg:
             groups.setdefault((h, w), []).append((name, last))
 
         sorted_hw = sorted(groups.keys(), key=lambda x: x[0])
-        max_det_h = sorted_hw[-1][0] if len(sorted_hw) > 1 else 0
 
-        reordered = []
-        for hw in sorted_hw:
-            members = groups[hw]
-            if len(members) == 1 and hw[0] > max_det_h:
-                proto_name = members[0][0]
+        # Separate proto from detection groups.
+        # Proto is the group with a single member whose spatial H is the largest
+        # (typically 160×160, well above any detection head grid size).
+        proto_name = None
+        det_hw_list = []
+        if len(groups) > 1:
+            # The group with the largest H is proto.
+            largest_hw = sorted_hw[-1]
+            if len(groups[largest_hw]) == 1:
+                proto_name = groups[largest_hw][0][0]
             else:
-                # Sort into (cls, box, mc) order by last_dim:
-                # cls has the largest last_dim (classes_num=80),
-                # box is always 4, mc is the remaining middle value (32).
-                def _seg_sort_key(item):
-                    last = item[1]
-                    if last == self.cfg.classes_num:
-                        return 0  # cls first
-                    elif last == 4:
-                        return 1  # box second
-                    else:
-                        return 2  # mc last
-                members.sort(key=_seg_sort_key)
-                for name, _ in members:
-                    reordered.append(name)
+                det_hw_list.append((largest_hw, groups[largest_hw]))
+            for hw in sorted_hw[:-1]:
+                det_hw_list.append((hw, groups[hw]))
+        else:
+            det_hw_list = [(hw, groups[hw]) for hw in sorted_hw]
+
+        # Build reordered output_names:
+        # Detection groups are processed in descending H order so that
+        # the largest grid (smallest stride=8) comes first, matching the
+        # standard strides iteration order [8, 16, 32].
+        reordered = []
+        for hw, members in reversed(det_hw_list):
+            # Sort into (cls, box, mc) order by last_dim:
+            # cls has the largest last_dim (classes_num),
+            # box is always 4, mc is the remaining value (32).
+            def _seg_sort_key(item):
+                last = item[1]
+                if last == self.cfg.classes_num:
+                    return 0  # cls first
+                elif last == 4:
+                    return 1  # box second
+                else:
+                    return 2  # mc last
+            members.sort(key=_seg_sort_key)
+            for name, _ in members:
+                reordered.append(name)
 
         if proto_name is not None:
             reordered.append(proto_name)
         self.output_names = reordered
+
+        # Detect combined model: only 2 outputs (detections + proto) instead of 3×strides+proto.
+        output_shapes_final = self.model.output_shapes[self.model_name]
+        self.is_combined = len(self.output_names) == 2
+        if self.is_combined:
+            for name in self.output_names:
+                s = output_shapes_final[name]
+                # Proto has large spatial (H>=64) and moderate channels (C<=64);
+                # detections have large C (>=64) and small spatial.
+                if s[2] >= 64 and s[1] <= 64:
+                    self.proto_name = name
+                else:
+                    self.det_name = name
 
     def set_scheduling_params(self,
                               priority: Optional[int] = None,
@@ -353,6 +382,59 @@ class YOLO26Seg:
         if nms_thres is None:
             nms_thres = self.cfg.nms_thres
         raw_outputs = outputs[self.model_name]
+
+        if self.is_combined:
+            # ---- Combined model path ----
+            # det output: shape [1, N, C, 1] where N=max_det, C=4+1+1+32 (box+score+cls+mc)
+            # proto output: shape [1, mc_dim, proto_h, proto_w]
+            det_data = raw_outputs[self.det_name]
+            proto_tensor = raw_outputs[self.proto_name]
+
+            # Squeeze singleton dims: [1, N, C, 1] → [N, C]
+            if det_data.shape[0] == 1:
+                det_data = det_data[0]
+            if det_data.shape[-1] == 1:
+                det_data = det_data[..., 0]
+
+            # Columns: [x1, y1, x2, y2, score, class_id, mc_0, ..., mc_31]
+            xyxy = det_data[:, :4]
+            score = det_data[:, 4]
+            cls = det_data[:, 5].astype(int)
+            mask_coefs = det_data[:, 6:]
+
+            # Filter by score threshold
+            valid = score >= score_thres
+            if not np.any(valid):
+                return np.array([]), np.array([]), np.array([]), np.array([])
+
+            xyxy = xyxy[valid]
+            score = score[valid]
+            cls = cls[valid]
+            mask_coefs = mask_coefs[valid]
+
+            keep = post_utils.NMS(xyxy, score, cls, nms_thres)
+            if not keep:
+                return np.array([]), np.array([]), np.array([]), np.array([])
+
+            xyxy = xyxy[keep]
+            score = score[keep]
+            cls = cls[keep]
+            mask_coefs = mask_coefs[keep]
+
+            # Proto: [1, C, H, W] → [C, H, W]
+            if proto_tensor.shape[0] == 1:
+                proto_tensor = proto_tensor[0]
+
+            masks = process_mask(proto_tensor, mask_coefs, xyxy,
+                                 (ori_img_h, ori_img_w), upsample=True)
+
+            xyxy = post_utils.scale_coords_back(xyxy, ori_img_w, ori_img_h,
+                                                self.input_w, self.input_h, self.cfg.resize_type)
+
+            logger.info(f"\033[1;31m[Seg] Post Process time = {1000 * (time.time() - t0):.2f} ms\033[0m")
+            return xyxy, score, cls.astype(int), masks
+
+        # ---- Standard multi-stride path ----
         decoded = []
 
         for i, stride in enumerate(self.cfg.strides):
