@@ -267,14 +267,18 @@ class SteelBallService:
 
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.camera = self._open_camera(args.camera, args.width, args.height, args.camera_fps, args.camera_format)
+        self.camera = self._open_camera(args.camera, args.width, args.height, args.camera_fps,
+                                        args.camera_format, args.mjpeg_passthrough)
         self.model = self._load_model(args)
         self.lock = threading.Lock()
         self.frame_ready = threading.Condition(self.lock)
         self.inference_lock = threading.Lock()
         self.running = True
         self.mode = "live"
+        self.mjpeg_passthrough = args.mjpeg_passthrough and args.camera_format == "MJPG"
+        self.mjpeg_passthrough_confirmed = False
         self.latest_jpeg: Optional[bytes] = None
+        self.latest_raw_jpeg: Optional[bytes] = None
         self.latest_raw_frame: Optional[np.ndarray] = None
         self.latest_detections: List[Dict[str, object]] = []
         self.latest_fps = 0.0
@@ -287,7 +291,8 @@ class SteelBallService:
         self.worker.start()
 
     @staticmethod
-    def _open_camera(camera: str, width: int, height: int, fps: int, pixel_format: str) -> cv2.VideoCapture:
+    def _open_camera(camera: str, width: int, height: int, fps: int, pixel_format: str,
+                     mjpeg_passthrough: bool) -> cv2.VideoCapture:
         source: object = int(camera) if camera.isdigit() else camera
         capture = cv2.VideoCapture(source, cv2.CAP_V4L2)
         if not capture.isOpened():
@@ -299,11 +304,14 @@ class SteelBallService:
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         capture.set(cv2.CAP_PROP_FPS, fps)
         capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if mjpeg_passthrough and pixel_format == "MJPG":
+            capture.set(cv2.CAP_PROP_CONVERT_RGB, 0)
         active_fourcc = int(capture.get(cv2.CAP_PROP_FOURCC))
         active_format = "".join(chr((active_fourcc >> (8 * index)) & 0xFF) for index in range(4))
-        LOG.info("摄像头协商结果：%dx%d, %.1f FPS, 像素格式=%s（请求=%s）",
+        LOG.info("摄像头协商结果：%dx%d, %.1f FPS, 像素格式=%s（请求=%s），MJPG直通=%s",
                  int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-                 capture.get(cv2.CAP_PROP_FPS), active_format, pixel_format)
+                 capture.get(cv2.CAP_PROP_FPS), active_format, pixel_format,
+                 "已请求" if mjpeg_passthrough and pixel_format == "MJPG" else "未启用")
         return capture
 
     @staticmethod
@@ -380,35 +388,69 @@ class SteelBallService:
         stream_height = round(frame.shape[0] * self.args.stream_width / frame.shape[1])
         return cv2.resize(frame, (self.args.stream_width, stream_height), interpolation=cv2.INTER_AREA)
 
+    @staticmethod
+    def _as_mjpeg(frame: np.ndarray) -> Optional[bytes]:
+        """Return a raw JPEG supplied by V4L2 when RGB conversion is disabled."""
+        raw = frame.reshape(-1)
+        if raw.size < 4 or raw[0] != 0xFF or raw[1] != 0xD8:
+            return None
+        return raw.tobytes()
+
+    @staticmethod
+    def _decode_mjpeg(jpeg: bytes) -> np.ndarray:
+        image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            raise RuntimeError("无法解码摄像头 MJPG 帧")
+        return image
+
     def _run(self) -> None:
         previous_time = time.monotonic()
         while self.running:
-            ok, frame = self.camera.read()
+            ok, camera_frame = self.camera.read()
             if not ok:
                 LOG.warning("摄像头读取失败，准备重试")
                 time.sleep(0.1)
                 continue
-            with self.lock:
-                mode = self.mode
-
             now = time.monotonic()
             elapsed = max(now - previous_time, 1e-6)
             previous_time = now
             detections: List[Dict[str, object]] = []
             fps = 1.0 / elapsed
+            raw_jpeg: Optional[bytes] = None
+            raw_frame: Optional[np.ndarray] = None
+            if self.mjpeg_passthrough:
+                raw_jpeg = self._as_mjpeg(camera_frame)
+                if raw_jpeg is None:
+                    self.mjpeg_passthrough = False
+                    self.camera.set(cv2.CAP_PROP_CONVERT_RGB, 1)
+                    LOG.warning("OpenCV 未返回原始 MJPG 帧，已回退到 BGR 解码和 JPEG 编码")
+                    continue
+                if not self.mjpeg_passthrough_confirmed:
+                    LOG.info("已启用 MJPG 原始帧直通，拍摄页面不再进行逐帧图像编解码")
+                    self.mjpeg_passthrough_confirmed = True
+
+            with self.lock:
+                mode = self.mode
+
             try:
                 if mode == "live":
+                    frame = self._decode_mjpeg(raw_jpeg) if raw_jpeg is not None else camera_frame
                     annotated, detections = self._infer(frame)
                     jpeg = self._encode(annotated)
+                    raw_frame = frame
+                elif raw_jpeg is not None:
+                    jpeg = raw_jpeg
                 else:
-                    jpeg = self._encode(self._preview_frame(frame), self.args.stream_jpeg_quality)
+                    raw_frame = camera_frame
+                    jpeg = self._encode(self._preview_frame(camera_frame), self.args.stream_jpeg_quality)
             except Exception:
                 LOG.exception("视频帧处理失败")
                 time.sleep(0.1)
                 continue
             with self.frame_ready:
                 self.latest_jpeg = jpeg
-                self.latest_raw_frame = frame
+                self.latest_raw_jpeg = raw_jpeg
+                self.latest_raw_frame = raw_frame
                 self.latest_fps = fps
                 if mode == "live":
                     self.latest_detections = detections
@@ -425,8 +467,10 @@ class SteelBallService:
         with self.lock:
             self.mode = mode
 
-    def _recognize_capture(self, frame: np.ndarray, capture_id: int) -> None:
+    def _recognize_capture(self, frame: np.ndarray | bytes, capture_id: int) -> None:
         try:
+            if isinstance(frame, bytes):
+                frame = self._decode_mjpeg(frame)
             annotated, detections = self._infer(frame)
             jpeg = self._encode(annotated)
             with self.lock:
@@ -475,10 +519,14 @@ class SteelBallService:
                 raise RuntimeError("请先切换到拍摄识别页面")
             if self.capture_state == "recognizing":
                 raise RuntimeError("上一张照片仍在识别中")
-            if self.latest_raw_frame is None:
+            if self.latest_raw_frame is None and self.latest_raw_jpeg is None:
                 raise RuntimeError("摄像头尚未产生可用画面")
-            frame = self.latest_raw_frame.copy()
-            image = base64.b64encode(self._encode(frame)).decode("ascii")
+            if self.latest_raw_jpeg is not None:
+                frame: np.ndarray | bytes = self.latest_raw_jpeg
+                image = base64.b64encode(frame).decode("ascii")
+            else:
+                frame = self.latest_raw_frame.copy()
+                image = base64.b64encode(self._encode(frame)).decode("ascii")
             self.capture_id += 1
             capture_id = self.capture_id
             self.capture_state = "recognizing"
@@ -591,6 +639,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-fps", type=int, default=30, help="摄像头请求帧率")
     parser.add_argument("--camera-format", choices=("MJPG", "YUYV"), default="MJPG",
                         help="摄像头像素格式，默认 MJPG 以降低 USB 传输带宽")
+    parser.add_argument("--mjpeg-passthrough", action=argparse.BooleanOptionalAction, default=True,
+                        help="拍摄模式直接转发摄像头 MJPG，避免 OpenCV 解码后重新编码")
     parser.add_argument("--stream-width", type=int, default=640,
                         help="拍摄页面网页预览流宽度；不影响原图拍摄和模型输入")
     parser.add_argument("--stream-jpeg-quality", type=int, default=75, choices=range(1, 101),
