@@ -143,9 +143,9 @@ def decode_seg_layer(box_feat: np.ndarray,
     grid_y, grid_x = np.indices((h, w))
     valid_grid_x = grid_x[mask]
     valid_grid_y = grid_y[mask]
-    valid_box = box_feat[mask]
-    valid_mc = mc_feat[mask]
-    valid_cls_logits = cls_feat[mask]
+    valid_box = np.atleast_2d(box_feat[mask])
+    valid_mc = np.atleast_2d(mc_feat[mask])
+    valid_cls_logits = np.atleast_2d(cls_feat[mask])
     valid_cls_scores = post_utils.sigmoid(valid_cls_logits)
     valid_score = np.max(valid_cls_scores, axis=-1)
     valid_cls_id = np.argmax(valid_cls_scores, axis=-1)
@@ -254,16 +254,15 @@ class YOLO26Seg:
         reordered = []
         for hw, members in reversed(det_hw_list):
             # Sort into (cls, box, mc) order by last_dim:
-            # cls has the largest last_dim (classes_num),
-            # box is always 4, mc is the remaining value (32).
+            # box is always 4, mc is always 32, cls is the remaining.
             def _seg_sort_key(item):
                 last = item[1]
-                if last == self.cfg.classes_num:
-                    return 0  # cls first
-                elif last == 4:
+                if last == 4:
                     return 1  # box second
-                else:
+                elif last == 32:
                     return 2  # mc last
+                else:
+                    return 0  # cls first (any other channel count)
             members.sort(key=_seg_sort_key)
             for name, _ in members:
                 reordered.append(name)

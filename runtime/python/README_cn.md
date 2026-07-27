@@ -75,8 +75,8 @@ pip install numpy opencv-python hbm-runtime scipy
 python3 main.py \
     --task seg \
     --model-path ../../model/yolo26n_seg_bayese_640x640_nv12.bin \
-    --test-img ../../../../../datasets/coco/assets/bus.jpg \
-    --img-save-path ../../test_data/result_seg.jpg
+    --test-img ../../test_data/input/5_mp4-0031_jpg.rf.e52a3599e3afa567008395247f8a911f.jpg \
+    --img-save-path ../../test_data/output/1.jpg
 ```
 
 ### 姿态估计
