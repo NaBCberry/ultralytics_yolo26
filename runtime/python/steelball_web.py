@@ -25,7 +25,7 @@ import numpy as np
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, "../.."))
 SHARED_PROJECTS_ROOT = os.path.abspath(os.path.join(PROJECT_ROOT, ".."))
-DEFAULT_MODEL_PATH = os.path.join(PROJECT_ROOT, "model", "steelball_seg_bpu_bayese_640x640_nv12.bin")
+DEFAULT_MODEL_PATH = "/userdata/rdkstudio/projects/ultralytics_yolo26/model/steelball-yolo26n-det_bayese_640x640_nv12.bin"
 
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
@@ -711,7 +711,7 @@ def create_server(service: SteelBallService, host: str, port: int) -> ThreadingH
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RDK 钢球实时识别网页服务")
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="钢球模型 .bin 文件路径")
-    parser.add_argument("--model-type", choices=("seg", "detect"), default="seg", help="模型任务类型")
+    parser.add_argument("--model-type", choices=("seg", "detect"), default="detect", help="模型任务类型")
     parser.add_argument("--camera", default="0", help="摄像头索引或设备路径，例如 0 或 /dev/video0")
     parser.add_argument("--width", type=int, default=1280, help="摄像头请求宽度")
     parser.add_argument("--height", type=int, default=720, help="摄像头请求高度")
