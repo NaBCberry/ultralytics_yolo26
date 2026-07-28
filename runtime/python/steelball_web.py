@@ -63,7 +63,13 @@ PAGE = """<!doctype html>
     .capture-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 22px; }
     .video-panel { background: #0b1220; border: 1px solid #334155; border-radius: 6px; overflow: hidden; }
     .panel-title { display: flex; align-items: center; justify-content: space-between; height: 46px; padding: 0 14px; background: #182235; border-bottom: 1px solid #334155; font-size: 14px; }
+    .stream-wrap { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #020617; }
     .stream { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #020617; }
+    .stream-wrap .stream { height: 100%; aspect-ratio: auto; }
+    .overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .overlay rect { fill: none; stroke: #22c55e; stroke-width: 2; vector-effect: non-scaling-stroke; }
+    .overlay circle { fill: #00bfff; }
+    .overlay text { fill: #22c55e; font: 14px Arial, sans-serif; paint-order: stroke; stroke: #020617; stroke-width: 3px; stroke-linejoin: round; }
     .placeholder { display: flex; align-items: center; justify-content: center; width: 100%; aspect-ratio: 16 / 9; color: #94a3b8; background: #020617; }
     .data-panel { border: 1px solid #334155; border-radius: 6px; overflow: hidden; background: #182235; }
     .stat { padding: 18px; border-bottom: 1px solid #334155; }
@@ -96,7 +102,10 @@ PAGE = """<!doctype html>
       <div class="live-layout">
         <div class="video-panel">
           <div class="panel-title"><span>实时视频流</span><span id="live-fps"></span></div>
-          <img class="stream" src="/video_feed" alt="实时钢球检测视频流">
+          <div class="stream-wrap">
+            <img class="stream" src="/video_feed" alt="实时钢球检测视频流">
+            <svg class="overlay" id="live-overlay" aria-hidden="true" preserveAspectRatio="xMidYMid meet"></svg>
+          </div>
         </div>
         <div class="data-panel">
           <div class="stat"><div class="stat-label">当前钢球数量</div><div class="count" id="live-count">0</div></div>
@@ -161,6 +170,22 @@ PAGE = """<!doctype html>
       return items.map((item, index) => `<div class="coordinate"><span>钢球 ${index + 1}</span><span>(${item.center_x}, ${item.center_y})</span></div>`).join('');
     }
 
+    function drawLiveOverlay(detections, frameWidth, frameHeight) {
+      const overlay = document.getElementById('live-overlay');
+      if (!frameWidth || !frameHeight) {
+        overlay.innerHTML = '';
+        return;
+      }
+      overlay.setAttribute('viewBox', `0 0 ${frameWidth} ${frameHeight}`);
+      overlay.innerHTML = detections.map((item) => {
+        const [x1, y1, x2, y2] = item.box;
+        const labelY = Math.max(y1 - 8, 18);
+        return `<rect x="${x1}" y="${y1}" width="${x2 - x1}" height="${y2 - y1}" />`
+          + `<circle cx="${item.center_x}" cy="${item.center_y}" r="4" />`
+          + `<text x="${x1}" y="${labelY}">ball ${item.id} ${item.score.toFixed(2)}</text>`;
+      }).join('');
+    }
+
     async function refreshLiveResults() {
       if (activeMode !== 'live') return;
       try {
@@ -169,6 +194,7 @@ PAGE = """<!doctype html>
         const data = await response.json();
         document.getElementById('live-count').textContent = data.count;
         document.getElementById('live-coordinates').innerHTML = coordinateRows(data.detections, '当前画面未识别到钢球');
+        drawLiveOverlay(data.detections, data.frame_width, data.frame_height);
         document.getElementById('live-fps').textContent = data.fps ? `${data.fps.toFixed(1)} FPS` : '';
         document.getElementById('connection').textContent = '设备已连接';
       } catch (_) {
@@ -255,7 +281,7 @@ PAGE = """<!doctype html>
     });
 
     refreshLiveResults();
-    window.setInterval(refreshLiveResults, 350);
+    window.setInterval(refreshLiveResults, 100);
     window.setInterval(refreshCaptureFps, 350);
   </script>
 </body>
@@ -281,7 +307,11 @@ class SteelBallService:
         self.latest_raw_jpeg: Optional[bytes] = None
         self.latest_raw_frame: Optional[np.ndarray] = None
         self.latest_detections: List[Dict[str, object]] = []
+        self.latest_frame_width = 0
+        self.latest_frame_height = 0
         self.latest_fps = 0.0
+        self.timing_samples = 0
+        self.timing_totals: Dict[str, float] = {}
         self.capture_id = 0
         self.capture_state = "idle"
         self.capture_jpeg: Optional[bytes] = None
@@ -337,13 +367,16 @@ class SteelBallService:
         model.set_scheduling_params(priority=args.priority, bpu_cores=args.bpu_cores)
         return model
 
-    def _infer(self, frame: np.ndarray) -> Tuple[np.ndarray, List[Dict[str, object]]]:
+    def _infer(self, frame: np.ndarray, annotate: bool = True) -> Tuple[np.ndarray, List[Dict[str, object]], float, float]:
+        inference_started = time.monotonic()
         with self.inference_lock:
             if self.args.model_type == "seg":
-                boxes, scores, _, _ = self.model.predict(frame)
+                boxes, scores, _, _ = self.model.predict(frame, return_masks=False)
             else:
                 boxes, scores, _ = self.model.predict(frame)
+        inference_ms = 1000 * (time.monotonic() - inference_started)
 
+        render_started = time.monotonic()
         detections: List[Dict[str, object]] = []
         for index, (box, score) in enumerate(zip(boxes, scores), start=1):
             x1, y1, x2, y2 = [int(round(value)) for value in box]
@@ -356,7 +389,32 @@ class SteelBallService:
                 "score": round(float(score), 3),
                 "box": [x1, y1, x2, y2],
             })
-        return self._draw(frame, detections), detections
+        annotated = self._draw(frame, detections) if annotate else frame
+        render_ms = 1000 * (time.monotonic() - render_started)
+        return annotated, detections, inference_ms, render_ms
+
+    def _record_timing(self, timings: Dict[str, float]) -> None:
+        """Log rolling live-pipeline averages without per-frame I/O."""
+        self.timing_samples += 1
+        for name, value in timings.items():
+            self.timing_totals[name] = self.timing_totals.get(name, 0.0) + value
+        if self.timing_samples < self.args.timing_interval:
+            return
+        average = {name: value / self.timing_samples for name, value in self.timing_totals.items()}
+        LOG.info(
+            "最近 %d 帧平均耗时：采集 %.1f ms，MJPG解码 %.1f ms，模型流水线 %.1f ms，"
+            "绘制 %.1f ms，JPEG编码 %.1f ms，总计 %.1f ms（%.1f FPS）",
+            self.timing_samples,
+            average["camera_read_ms"],
+            average["decode_ms"],
+            average["inference_ms"],
+            average["render_ms"],
+            average["encode_ms"],
+            average["total_ms"],
+            1000 / max(average["total_ms"], 1e-6),
+        )
+        self.timing_samples = 0
+        self.timing_totals.clear()
 
     @staticmethod
     def _draw(frame: np.ndarray, detections: List[Dict[str, object]]) -> np.ndarray:
@@ -406,7 +464,9 @@ class SteelBallService:
     def _run(self) -> None:
         previous_time = time.monotonic()
         while self.running:
+            frame_started = time.monotonic()
             ok, camera_frame = self.camera.read()
+            camera_read_ms = 1000 * (time.monotonic() - frame_started)
             if not ok:
                 LOG.warning("摄像头读取失败，准备重试")
                 time.sleep(0.1)
@@ -416,6 +476,13 @@ class SteelBallService:
             previous_time = now
             detections: List[Dict[str, object]] = []
             fps = 1.0 / elapsed
+            timings = {
+                "camera_read_ms": camera_read_ms,
+                "decode_ms": 0.0,
+                "inference_ms": 0.0,
+                "render_ms": 0.0,
+                "encode_ms": 0.0,
+            }
             raw_jpeg: Optional[bytes] = None
             raw_frame: Optional[np.ndarray] = None
             if self.mjpeg_passthrough:
@@ -434,9 +501,16 @@ class SteelBallService:
 
             try:
                 if mode == "live":
+                    decode_started = time.monotonic()
                     frame = self._decode_mjpeg(raw_jpeg) if raw_jpeg is not None else camera_frame
-                    annotated, detections = self._infer(frame)
-                    jpeg = self._encode(annotated)
+                    timings["decode_ms"] = 1000 * (time.monotonic() - decode_started)
+                    _, detections, timings["inference_ms"], timings["render_ms"] = self._infer(frame, annotate=False)
+                    if raw_jpeg is not None:
+                        jpeg = raw_jpeg
+                    else:
+                        encode_started = time.monotonic()
+                        jpeg = self._encode(self._preview_frame(frame), self.args.stream_jpeg_quality)
+                        timings["encode_ms"] = 1000 * (time.monotonic() - encode_started)
                     raw_frame = frame
                 elif raw_jpeg is not None:
                     jpeg = raw_jpeg
@@ -447,6 +521,9 @@ class SteelBallService:
                 LOG.exception("视频帧处理失败")
                 time.sleep(0.1)
                 continue
+            timings["total_ms"] = 1000 * (time.monotonic() - frame_started)
+            if mode == "live":
+                self._record_timing(timings)
             with self.frame_ready:
                 self.latest_jpeg = jpeg
                 self.latest_raw_jpeg = raw_jpeg
@@ -454,12 +531,14 @@ class SteelBallService:
                 self.latest_fps = fps
                 if mode == "live":
                     self.latest_detections = detections
+                    self.latest_frame_height, self.latest_frame_width = frame.shape[:2]
                 self.frame_ready.notify_all()
 
     def get_results(self) -> Dict[str, object]:
         with self.lock:
             detections = [dict(item) for item in self.latest_detections]
-            return {"count": len(detections), "detections": detections, "fps": self.latest_fps}
+            return {"count": len(detections), "detections": detections, "fps": self.latest_fps,
+                    "frame_width": self.latest_frame_width, "frame_height": self.latest_frame_height}
 
     def set_mode(self, mode: str) -> None:
         if mode not in ("live", "capture"):
@@ -471,7 +550,7 @@ class SteelBallService:
         try:
             if isinstance(frame, bytes):
                 frame = self._decode_mjpeg(frame)
-            annotated, detections = self._infer(frame)
+            annotated, detections, _, _ = self._infer(frame)
             jpeg = self._encode(annotated)
             with self.lock:
                 if self.capture_id == capture_id:
@@ -651,12 +730,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nms-thres", type=float, default=0.65, help="NMS 阈值")
     parser.add_argument("--priority", type=int, default=0, help="BPU 调度优先级")
     parser.add_argument("--bpu-cores", type=int, nargs="+", default=[0], help="使用的 BPU Core 编号")
+    parser.add_argument("--timing-interval", type=int, default=60,
+                        help="每隔多少实时识别帧输出一次服务端平均耗时")
+    parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO",
+                        help="日志级别；使用 DEBUG 可查看各推理阶段耗时")
     return parser.parse_args()
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="[%(name)s] %(levelname)s: %(message)s")
     args = parse_args()
+    logging.basicConfig(level=getattr(logging, args.log_level), format="[%(name)s] %(levelname)s: %(message)s")
     if not os.path.isfile(args.model_path):
         raise FileNotFoundError(f"未找到模型文件：{args.model_path}")
     service = SteelBallService(args)

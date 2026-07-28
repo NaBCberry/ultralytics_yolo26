@@ -314,7 +314,7 @@ class YOLO26Seg:
         else:
             raise ValueError(f"Unsupported image_format: {image_format}")
 
-        logger.info(f"\033[1;31m[Seg] Pre-process time = {1000 * (time.time() - t0):.2f} ms\033[0m")
+        logger.debug("[Seg] Pre-process time = %.2f ms", 1000 * (time.time() - t0))
         
         packed_nv12 = np.concatenate([y.reshape(-1), uv.reshape(-1)]).astype(np.uint8)
         return {
@@ -335,7 +335,7 @@ class YOLO26Seg:
         """
         t0 = time.time()
         outputs = self.model.run(input_tensor)
-        logger.info(f"\033[1;31m[Seg] Forward time = {1000 * (time.time() - t0):.2f} ms\033[0m")
+        logger.debug("[Seg] Forward time = %.2f ms", 1000 * (time.time() - t0))
         return outputs
 
     def post_process(self,
@@ -344,6 +344,7 @@ class YOLO26Seg:
                      ori_img_h: int,
                      score_thres: Optional[float] = None,
                      nms_thres: Optional[float] = None,
+                     return_masks: bool = True,
                      ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Convert raw model outputs to final segmentation results.
@@ -354,6 +355,7 @@ class YOLO26Seg:
             ori_img_h (int): Original image height.
             score_thres (Optional[float]): Override confidence threshold.
             nms_thres (Optional[float]): Override NMS threshold.
+            return_masks (bool): Whether to construct instance masks.
 
         Returns:
             Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -382,11 +384,6 @@ class YOLO26Seg:
                                           stride, score_thres, self.cfg.classes_num)
             decoded.append(layer_pred)
 
-        proto_tensor = raw_outputs[self.output_names[9]]
-        if proto_tensor.shape[0] == 1: 
-            proto_tensor = proto_tensor[0]
-        proto_tensor = np.transpose(proto_tensor, (2, 0, 1))
-
         if not decoded:
              return np.array([]), np.array([]), np.array([]), np.array([])
         
@@ -397,7 +394,7 @@ class YOLO26Seg:
         xyxy = pred[:, :4]
         score = pred[:, 4]
         cls = pred[:, 5]
-        mask_coefs = pred[:, 6:]
+        mask_coefs = pred[:, 6:] if return_masks else None
 
         keep = post_utils.NMS(xyxy, score, cls, nms_thres)
 
@@ -407,15 +404,20 @@ class YOLO26Seg:
         xyxy = xyxy[keep]
         score = score[keep]
         cls = cls[keep]
-        mask_coefs = mask_coefs[keep]
-
-        masks = process_mask(proto_tensor, mask_coefs, xyxy, 
-                             (ori_img_h, ori_img_w), upsample=True)
+        if return_masks:
+            proto_tensor = raw_outputs[self.output_names[9]]
+            if proto_tensor.shape[0] == 1:
+                proto_tensor = proto_tensor[0]
+            proto_tensor = np.transpose(proto_tensor, (2, 0, 1))
+            masks = process_mask(proto_tensor, mask_coefs[keep], xyxy,
+                                 (ori_img_h, ori_img_w), upsample=True)
+        else:
+            masks = np.array([])
 
         xyxy = post_utils.scale_coords_back(xyxy, ori_img_w, ori_img_h,
                                             self.input_w, self.input_h, self.cfg.resize_type)
 
-        logger.info(f"\033[1;31m[Seg] Post Process time = {1000 * (time.time() - t0):.2f} ms\033[0m")
+        logger.debug("[Seg] Post Process time = %.2f ms", 1000 * (time.time() - t0))
         
         return xyxy, score, cls.astype(int), masks
 
@@ -425,6 +427,7 @@ class YOLO26Seg:
                 resize_type: Optional[int] = None,
                 score_thres: Optional[float] = None,
                 nms_thres: Optional[float] = None,
+                return_masks: bool = True,
                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Run the complete segmentation pipeline on a single image.
@@ -435,6 +438,7 @@ class YOLO26Seg:
             resize_type (Optional[int]): Resize strategy.
             score_thres (Optional[float]): Confidence threshold.
             nms_thres (Optional[float]): NMS threshold.
+            return_masks (bool): Whether to construct instance masks.
 
         Returns:
             Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: Segmentation results.
@@ -442,7 +446,7 @@ class YOLO26Seg:
         ori_img_h, ori_img_w = img.shape[:2]
         inp = self.pre_process(img, resize_type, image_format)
         out = self.forward(inp)
-        return self.post_process(out, ori_img_w, ori_img_h, score_thres, nms_thres)
+        return self.post_process(out, ori_img_w, ori_img_h, score_thres, nms_thres, return_masks)
 
     def __call__(self,
                  img: np.ndarray,
@@ -450,6 +454,7 @@ class YOLO26Seg:
                  resize_type: Optional[int] = None,
                  score_thres: Optional[float] = None,
                  nms_thres: Optional[float] = None,
+                 return_masks: bool = True,
                  ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Provide functional-style calling capability.
@@ -460,9 +465,10 @@ class YOLO26Seg:
             resize_type (Optional[int]): Resize strategy.
             score_thres (Optional[float]): Confidence threshold.
             nms_thres (Optional[float]): NMS threshold.
+            return_masks (bool): Whether to construct instance masks.
 
         Returns:
             Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
                 Segmentation results from `predict()`.
         """
-        return self.predict(img, image_format, resize_type, score_thres, nms_thres)
+        return self.predict(img, image_format, resize_type, score_thres, nms_thres, return_masks)
