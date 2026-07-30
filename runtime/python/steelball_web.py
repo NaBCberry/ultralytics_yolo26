@@ -66,10 +66,6 @@ PAGE = """<!doctype html>
     .stream-wrap { position: relative; width: 100%; aspect-ratio: 16 / 9; background: #020617; }
     .stream { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #020617; }
     .stream-wrap .stream { height: 100%; aspect-ratio: auto; }
-    .overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
-    .overlay rect { fill: none; stroke: #22c55e; stroke-width: 2; vector-effect: non-scaling-stroke; }
-    .overlay circle { fill: #00bfff; }
-    .overlay text { fill: #22c55e; font: 14px Arial, sans-serif; paint-order: stroke; stroke: #020617; stroke-width: 3px; stroke-linejoin: round; }
     .placeholder { display: flex; align-items: center; justify-content: center; width: 100%; aspect-ratio: 16 / 9; color: #94a3b8; background: #020617; }
     .data-panel { border: 1px solid #334155; border-radius: 6px; overflow: hidden; background: #182235; }
     .stat { padding: 18px; border-bottom: 1px solid #334155; }
@@ -104,7 +100,6 @@ PAGE = """<!doctype html>
           <div class="panel-title"><span>实时视频流</span><span id="live-fps"></span></div>
           <div class="stream-wrap">
             <img class="stream" src="/video_feed" alt="实时钢球检测视频流">
-            <svg class="overlay" id="live-overlay" aria-hidden="true" preserveAspectRatio="xMidYMid meet"></svg>
           </div>
         </div>
         <div class="data-panel">
@@ -170,22 +165,6 @@ PAGE = """<!doctype html>
       return items.map((item, index) => `<div class="coordinate"><span>钢球 ${index + 1}</span><span>(${item.center_x}, ${item.center_y})</span></div>`).join('');
     }
 
-    function drawLiveOverlay(detections, frameWidth, frameHeight) {
-      const overlay = document.getElementById('live-overlay');
-      if (!frameWidth || !frameHeight) {
-        overlay.innerHTML = '';
-        return;
-      }
-      overlay.setAttribute('viewBox', `0 0 ${frameWidth} ${frameHeight}`);
-      overlay.innerHTML = detections.map((item) => {
-        const [x1, y1, x2, y2] = item.box;
-        const labelY = Math.max(y1 - 8, 18);
-        return `<rect x="${x1}" y="${y1}" width="${x2 - x1}" height="${y2 - y1}" />`
-          + `<circle cx="${item.center_x}" cy="${item.center_y}" r="4" />`
-          + `<text x="${x1}" y="${labelY}">ball ${item.id} ${item.score.toFixed(2)}</text>`;
-      }).join('');
-    }
-
     async function refreshLiveResults() {
       if (activeMode !== 'live') return;
       try {
@@ -194,7 +173,7 @@ PAGE = """<!doctype html>
         const data = await response.json();
         document.getElementById('live-count').textContent = data.count;
         document.getElementById('live-coordinates').innerHTML = coordinateRows(data.detections, '当前画面未识别到钢球');
-        drawLiveOverlay(data.detections, data.frame_width, data.frame_height);
+
         document.getElementById('live-fps').textContent = data.fps ? `${data.fps.toFixed(1)} FPS` : '';
         document.getElementById('connection').textContent = '设备已连接';
       } catch (_) {
@@ -504,13 +483,10 @@ class SteelBallService:
                     decode_started = time.monotonic()
                     frame = self._decode_mjpeg(raw_jpeg) if raw_jpeg is not None else camera_frame
                     timings["decode_ms"] = 1000 * (time.monotonic() - decode_started)
-                    _, detections, timings["inference_ms"], timings["render_ms"] = self._infer(frame, annotate=False)
-                    if raw_jpeg is not None:
-                        jpeg = raw_jpeg
-                    else:
-                        encode_started = time.monotonic()
-                        jpeg = self._encode(self._preview_frame(frame), self.args.stream_jpeg_quality)
-                        timings["encode_ms"] = 1000 * (time.monotonic() - encode_started)
+                    annotated, detections, timings["inference_ms"], timings["render_ms"] = self._infer(frame, annotate=True)
+                    encode_started = time.monotonic()
+                    jpeg = self._encode(self._preview_frame(annotated), self.args.stream_jpeg_quality)
+                    timings["encode_ms"] = 1000 * (time.monotonic() - encode_started)
                     raw_frame = frame
                 elif raw_jpeg is not None:
                     jpeg = raw_jpeg
